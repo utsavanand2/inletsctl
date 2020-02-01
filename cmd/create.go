@@ -7,8 +7,12 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io/ioutil"
+	"os"
+	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	names "github.com/inlets/inletsctl/pkg/names"
@@ -38,6 +42,10 @@ func init() {
 	createCmd.Flags().StringP("remote-tcp", "c", "", `Remote host for inlets-pro to use for forwarding TCP connections`)
 
 	createCmd.Flags().DurationP("poll", "n", time.Second*2, "poll every N seconds, use a higher value if you encounter rate-limiting")
+
+	createCmd.Flags().Bool("rm", true, "Delete the exit node on")
+	createCmd.Flags().StringP("upstream", "u", "http://127.0.0.1:3000", "")
+	createCmd.Flags().StringP("license", "l", "", "The license key for inlets-pro")
 }
 
 // clientCmd represents the client sub command.
@@ -60,6 +68,11 @@ along with what OS version and spec will be used is explained in the README.
 }
 
 func runCreate(cmd *cobra.Command, _ []string) error {
+
+	tempFlag, err := cmd.Flags().GetBool("rm")
+	if err != nil {
+		return fmt.Errorf("cannot get value for --rm flag: %v", err)
+	}
 
 	provider, err := cmd.Flags().GetString("provider")
 	if err != nil {
@@ -139,15 +152,19 @@ func runCreate(cmd *cobra.Command, _ []string) error {
 	}
 
 	remoteTCP, _ := cmd.Flags().GetString("remote-tcp")
+	upstream, _ := cmd.Flags().GetString("upstream")
+
 	var pro bool
+	var inletsProLicenseKey string
 	if len(remoteTCP) > 0 {
 		pro = true
+		inletsProLicenseKey, _ = cmd.Flags().GetString("license")
 	}
-
 
 	name := strings.Replace(names.GetRandomName(10), "_", "-", -1)
 
 	inletsControlPort := 8080
+	proPort := 8123
 
 	userData := makeUserdata(inletsToken, inletsControlPort, remoteTCP)
 
@@ -184,41 +201,86 @@ func runCreate(cmd *cobra.Command, _ []string) error {
 			i+1, max, hostStatus.ID, hostStatus.Status)
 
 		if hostStatus.Status == "active" {
-			if !pro {
-				fmt.Printf(`Inlets OSS exit-node summary:
-  IP: %s
-  Auth-token: %s
+			if tempFlag == true {
+				// TODO: Invoke inlets client to create a temp tunnel
+				sig := make(chan os.Signal, 1)
+				done := make(chan bool, 1)
 
-Command:
-  export UPSTREAM=http://127.0.0.1:8000
-  inlets client --remote "ws://%s:%d" \
-	--token "%s" \
-	--upstream $UPSTREAM
+				signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
-To Delete:
-	inletsctl delete --provider %s --id "%s"
-`,
-					hostStatus.IP, inletsToken, hostStatus.IP, inletsControlPort, inletsToken, provider, hostStatus.ID)
-				return nil
+				go func() {
+					sigval := <-sig
+					fmt.Printf("\n%v\n", sigval)
+					done <- true
+				}()
+
+				fmt.Printf("Your IP is: %s\n", hostStatus.IP)
+
+				port := inletsControlPort
+				if pro {
+					port = proPort
+				}
+
+				var err error = nil
+				if pro {
+					err = runInletsClient(pro, hostStatus.IP, remoteTCP, port, inletsToken, inletsProLicenseKey)
+				} else {
+					err = runInletsClient(pro, hostStatus.IP, upstream, port, inletsToken, "")
+				}
+				if err != nil {
+					return fmt.Errorf("Error running inlets: %v", err)
+				}
+
+				<-done
+				hostDelReq := provision.HostDeleteRequest{
+					ID:        hostStatus.ID,
+					IP:        hostStatus.IP,
+					ProjectID: projectID,
+					Zone:      zone,
+				}
+				fmt.Println("Deleting tunnel")
+				err = provisioner.Delete(hostDelReq)
+				if err != nil {
+					return fmt.Errorf("error deleting the exitnode: %v", err)
+				}
+				fmt.Println("exiting")
+
+			} else {
+				if !pro {
+					fmt.Printf(`Inlets OSS exit-node summary:
+	  IP: %s
+	  Auth-token: %s
+	
+	Command:
+	  export UPSTREAM=http://127.0.0.1:8000
+	  inlets client --remote "ws://%s:%d" \
+		--token "%s" \
+		--upstream $UPSTREAM
+	
+	To Delete:
+		inletsctl delete --provider %s --id "%s"
+	`,
+						hostStatus.IP, inletsToken, hostStatus.IP, inletsControlPort, inletsToken, provider, hostStatus.ID)
+					return nil
+				}
+
+				fmt.Printf(`inlets-pro exit-node summary:
+	  IP: %s
+	  Auth-token: %s
+	
+	Command:
+	  export TCP_PORTS="8000"
+	  export LICENSE=""
+	  inlets-pro client --connect "wss://%s:%d/connect" \
+		--token "%s" \
+		--license "$LICENSE" \
+		--tcp-ports $TCP_PORTS
+	
+	To Delete:
+		  inletsctl delete --provider %s --id "%s"
+	`,
+					hostStatus.IP, inletsToken, hostStatus.IP, proPort, inletsToken, provider, hostStatus.ID)
 			}
-
-			proPort := 8123
-			fmt.Printf(`inlets-pro exit-node summary:
-  IP: %s
-  Auth-token: %s
-
-Command:
-  export TCP_PORTS="8000"
-  export LICENSE=""
-  inlets-pro client --connect "wss://%s:%d/connect" \
-	--token "%s" \
-	--license "$LICENSE" \
-	--tcp-ports $TCP_PORTS
-
-To Delete:
-	  inletsctl delete --provider %s --id "%s"
-`,
-				hostStatus.IP, inletsToken, hostStatus.IP, proPort, inletsToken, provider, hostStatus.ID)
 
 			return nil
 		}
@@ -313,7 +375,7 @@ func createHost(provider, name, region, zone, projectID, userData, inletsPort st
 			UserData: base64.StdEncoding.EncodeToString([]byte(userData)),
 			Additional: map[string]string{
 				"inlets-port": inletsPort,
-				"pro": fmt.Sprint(pro),
+				"pro":         fmt.Sprint(pro),
 			},
 		}, nil
 	}
@@ -380,4 +442,55 @@ func getFileOrString(flags *pflag.FlagSet, file, value string, required bool) (s
 	}
 
 	return val, nil
+}
+
+func checkIfInletsIsInstalled(usingPro bool) (bool, error) {
+	basePath := "/usr/local/bin/%s"
+	if usingPro {
+		basePath = fmt.Sprintf(basePath, "inlets-pro")
+	} else {
+		basePath = fmt.Sprintf(basePath, "inlets")
+	}
+
+	fileInfo, err := os.Stat(basePath)
+	if err != nil {
+		return false, fmt.Errorf("Error finding file: %v", err)
+	}
+
+	if strings.SplitAfter(basePath, "/usr/local/bin/")[1] == fileInfo.Name() {
+		return true, nil
+	} else {
+		return false, nil
+	}
+
+}
+
+func runInletsClient(pro bool, exitNodeIP string, upstream string, inletsControlPort int, authToken string, license string) error {
+	installed, err := checkIfInletsIsInstalled(pro)
+	if err != nil {
+		return fmt.Errorf("could not check if inlets is installed: %v", err)
+	}
+
+	if !installed {
+		return fmt.Errorf("inlets/inlets-pro not installed")
+	}
+
+	if !pro {
+		fmt.Printf("Starting 'inlets client' now, hit control+c to delete the tunnel\n")
+		cmd := exec.Command("inlets", "client", "--remote", fmt.Sprintf("ws://%s:%d", exitNodeIP, inletsControlPort),
+			"--token", authToken, "--upstream", upstream)
+		err = cmd.Run()
+
+	} else {
+		fmt.Printf("Starting 'inlets-pro client' now, hit control+c to delete the tunnel\n")
+		cmd := exec.Command("inlets-pro", "client", "--connect", fmt.Sprintf("wss://%s:%d", exitNodeIP, inletsControlPort),
+			"--token", authToken, "--license", license, "--remote-tcp", upstream)
+		err = cmd.Run()
+	}
+
+	if err != nil && fmt.Sprintf("%s", err) != "signal: interrupt" {
+		return fmt.Errorf("%v", err)
+	}
+
+	return nil
 }
