@@ -90,17 +90,25 @@ func (p *GCEProvisioner) Provision(host BasicHost) (*ProvisionedHost, error) {
 		},
 	}
 
-	exists, _ := p.checkInletsFirewallRuleExists(host.Additional["projectid"], host.Additional["firewall-name"], host.Additional["firewall-port"])
+	exists, _ := p.checkInletsFirewallRuleExists(host.Additional["projectid"], host.Additional["firewall-name"])
 
 	if !exists {
-		err := p.createInletsFirewallRule(host.Additional["projectid"], host.Additional["firewall-name"], host.Additional["firewall-port"])
 		log.Println("inlets firewallRule does not exist")
+		log.Printf("Creating inlets firewallRule opening port: %s\n", host.Additional["firewall-port"])
+		err := p.createInletsFirewallRule(host.Additional["projectid"], host.Additional["firewall-name"], host.Additional["firewall-port"], host.Additional["pro"])
 		if err != nil {
 			return nil, fmt.Errorf("could not create inlets firewall rule: %v", err)
 		}
-		log.Printf("Creating inlets firewallRule opening port: %s\n", host.Additional["firewall-port"])
 	} else {
-		log.Println("inlets firewallRule exists")
+		log.Println("inlets firewallRule exists, updating firewall-rules")
+		err := p.deleteInletsFirewallRule(host.Additional["projectid"], host.Additional["firewall-name"])
+		if err != nil {
+			return nil, fmt.Errorf("could not delete inlets firewall rule: %v", err)
+		}
+		err = p.createInletsFirewallRule(host.Additional["projectid"], host.Additional["firewall-name"], host.Additional["firewall-port"], host.Additional["pro"])
+		if err != nil {
+			return nil, fmt.Errorf("could not create inlets firewall rule: %v", err)
+		}
 	}
 
 	op, err := p.gceProvisioner.Instances.Insert(host.Additional["projectid"], host.Additional["zone"], instance).Do()
@@ -121,25 +129,32 @@ func (p *GCEProvisioner) Provision(host BasicHost) (*ProvisionedHost, error) {
 }
 
 // checkInletsFirewallRuleExists checks if the inlets firewall rule exists or not
-func (p *GCEProvisioner) checkInletsFirewallRuleExists(projectID string, firewallRuleName string, inletsPort string) (bool, error) {
+func (p *GCEProvisioner) checkInletsFirewallRuleExists(projectID string, firewallRuleName string) (bool, error) {
 	op, err := p.gceProvisioner.Firewalls.Get(projectID, firewallRuleName).Do()
 	if err != nil {
 		return false, fmt.Errorf("could not get inlets firewall rule: %v", err)
 	}
 	if op.Name == firewallRuleName {
-		for _, firewallRule := range op.Allowed {
-			for _, port := range firewallRule.Ports {
-				if port == inletsPort {
-					return true, nil
-				}
-			}
-		}
+		return true, nil
 	}
 	return false, nil
 }
 
+// deleteInletsFirewallRule deletes the existing firewallRule (Used to update the firewallRule ports)
+func (p *GCEProvisioner) deleteInletsFirewallRule(projectID string, firewallRuleName string) error {
+	_, err := p.gceProvisioner.Firewalls.Delete(projectID, firewallRuleName).Do()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 // createInletsFirewallRule creates a firewall rule opening up the control port for inlets
-func (p *GCEProvisioner) createInletsFirewallRule(projectID string, firewallRuleName string, inletsPort string) error {
+func (p *GCEProvisioner) createInletsFirewallRule(projectID string, firewallRuleName string, inletsPort string, pro string) error {
+	if pro == "true" {
+		inletsPort = "1024-65535"
+	}
+
 	firewallRule := &compute.Firewall{
 		Name:        firewallRuleName,
 		Description: "Firewall rule created by inlets-operator",
@@ -157,7 +172,7 @@ func (p *GCEProvisioner) createInletsFirewallRule(projectID string, firewallRule
 
 	_, err := p.gceProvisioner.Firewalls.Insert(projectID, firewallRule).Do()
 	if err != nil {
-		return fmt.Errorf("could not create firewall rule: %v", err)
+		return err
 	}
 	return nil
 }

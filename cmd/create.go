@@ -24,6 +24,8 @@ import (
 	"github.com/spf13/pflag"
 )
 
+var delTunnel bool
+
 func init() {
 	inletsCmd.AddCommand(createCmd)
 	createCmd.Flags().StringP("provider", "p", "digitalocean", "The cloud provider - digitalocean, gce, ec2, packet, scaleway, or civo")
@@ -43,7 +45,7 @@ func init() {
 
 	createCmd.Flags().DurationP("poll", "n", time.Second*2, "poll every N seconds, use a higher value if you encounter rate-limiting")
 
-	createCmd.Flags().Bool("rm", true, "Delete the exit node on")
+	createCmd.Flags().BoolVar(&delTunnel, "rm", false, "Delete the exit node on")
 	createCmd.Flags().StringP("upstream", "u", "http://127.0.0.1:3000", "")
 	createCmd.Flags().StringP("license", "l", "", "The license key for inlets-pro")
 }
@@ -68,12 +70,6 @@ along with what OS version and spec will be used is explained in the README.
 }
 
 func runCreate(cmd *cobra.Command, _ []string) error {
-
-	tempFlag, err := cmd.Flags().GetBool("rm")
-	if err != nil {
-		return fmt.Errorf("cannot get value for --rm flag: %v", err)
-	}
-
 	provider, err := cmd.Flags().GetString("provider")
 	if err != nil {
 		return errors.Wrap(err, "failed to get 'provider' value.")
@@ -165,6 +161,9 @@ func runCreate(cmd *cobra.Command, _ []string) error {
 
 	inletsControlPort := 8080
 	proPort := 8123
+	if pro {
+		inletsControlPort = proPort
+	}
 
 	userData := makeUserdata(inletsToken, inletsControlPort, remoteTCP)
 
@@ -197,12 +196,8 @@ func runCreate(cmd *cobra.Command, _ []string) error {
 			return err
 		}
 
-		fmt.Printf("[%d/%d] Host: %s, status: %s\n",
-			i+1, max, hostStatus.ID, hostStatus.Status)
-
 		if hostStatus.Status == "active" {
-			if tempFlag == true {
-				// TODO: Invoke inlets client to create a temp tunnel
+			if delTunnel == true {
 				sig := make(chan os.Signal, 1)
 				done := make(chan bool, 1)
 
@@ -362,6 +357,7 @@ func createHost(provider, name, region, zone, projectID, userData, inletsPort st
 				"zone":          zone,
 				"firewall-name": "inlets",
 				"firewall-port": inletsPort,
+				"pro":           fmt.Sprint(pro),
 			},
 		}, nil
 	} else if provider == "ec2" {
