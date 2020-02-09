@@ -6,8 +6,11 @@ package cmd
 import (
 	"encoding/base64"
 	"fmt"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/inlets/inletsctl/pkg/env"
@@ -15,13 +18,17 @@ import (
 	"github.com/inlets/inletsctl/pkg/names"
 	"github.com/inlets/inletsctl/pkg/provision"
 
+	execute "github.com/alexellis/go-execute/pkg/v1"
 	"github.com/pkg/errors"
 	"github.com/sethvargo/go-password/password"
 	"github.com/spf13/cobra"
 )
 
-const inletsControlPort = 8080
+var inletsControlPort = 8080
+
 const inletsProControlPort = 8123
+
+var delTunnel bool
 
 func init() {
 
@@ -41,8 +48,13 @@ func init() {
 	createCmd.Flags().String("project-id", "", "Project ID (Packet.com, Google Compute Engine)")
 
 	createCmd.Flags().StringP("remote-tcp", "c", "", `Remote host for inlets-pro to use for forwarding TCP connections`)
+	createCmd.Flags().String("tcp-ports", "80,443", "Comma-separated list of TCP ports to proxy (default '80,443')")
 
 	createCmd.Flags().DurationP("poll", "n", time.Second*2, "poll every N seconds, use a higher value if you encounter rate-limiting")
+
+	createCmd.Flags().BoolVar(&delTunnel, "rm", false, "Delete the exit node on pressing control + c")
+	createCmd.Flags().StringP("upstream", "u", "", "The upstream server running locally")
+	createCmd.Flags().StringP("license", "l", "", "The license key for inlets-pro")
 }
 
 // clientCmd represents the client sub command.
@@ -52,20 +64,41 @@ var createCmd = &cobra.Command{
 	Long: `Create an exit node on cloud infrastructure. The estimated cost of each VM 
 along with what OS version and spec will be used is explained in the README.
 `,
-	Example: `  inletsctl create  \
+	Example: `	# To use inlets-OSS run
+	inletsctl create  \
 	--provider [digitalocean|packet|ec2|scaleway|civo|gce] \
-	--access-token-file $HOME/access-token \
-	--region lon1
+	--access-token-file $HOME/access-token
 
-  # For inlets-pro, give the --remote-tcp flag
-  inletsctl create --remote-tcp 192.168.0.100`,
+
+  	# To create a temporary tunnel with inlets-OSS run
+  	inletsctl create --rm \
+  	--provider [digitalocean|packet|ec2|scaleway|civo|gce] \
+  	--access-token-file $HOME/access-token \
+  	--upstream http://127.0.0.1:3000
+
+
+  	# For inlets-pro, give the --remote-tcp flag
+	  inletsctl create \
+	  --proider [digitalocean|packet|ec2|scaleway|civo|gce] \
+	  --access-token-file $HOME/access-token \
+	  --remote-tcp 192.168.0.100 \
+	  --tcp-ports=80,443,8080
+
+
+  	# To create a temporary tunnel with inlets-pro run
+  	inletsctl create --rm \
+  	--provider [digitalocean|packet|ec2|scaleway|civo|gce] \
+  	--access-token-file $HOME/access-token \
+  	--remote-tcp 127.0.0.1:3000
+  	--tcp-ports=80,443,8080
+  	--license=$INLETS_LICENSE`,
+
 	RunE:          runCreate,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 }
 
 func runCreate(cmd *cobra.Command, _ []string) error {
-
 	provider, err := cmd.Flags().GetString("provider")
 	if err != nil {
 		return errors.Wrap(err, "failed to get 'provider' value.")
@@ -129,7 +162,6 @@ func runCreate(cmd *cobra.Command, _ []string) error {
 	var organisationID string
 	var projectID string
 	if provider == "scaleway" || provider == "ec2" {
-
 		var secretKeyErr error
 		secretKey, secretKeyErr = getFileOrString(cmd.Flags(), "secret-key-file", "secret-key", true)
 		if secretKeyErr != nil {
@@ -156,9 +188,24 @@ func runCreate(cmd *cobra.Command, _ []string) error {
 	}
 
 	remoteTCP, _ := cmd.Flags().GetString("remote-tcp")
+	upstream, _ := cmd.Flags().GetString("upstream")
+	if delTunnel == true {
+		if len(remoteTCP) == 0 && len(upstream) == 0 {
+			return fmt.Errorf("either of --remote-tcp or --upstream must be specified")
+		}
+	}
+
 	var pro bool
+	var tcpPorts string
+	var inletsProLicenseKey string
 	if len(remoteTCP) > 0 {
 		pro = true
+		tcpPorts, _ = cmd.Flags().GetString("tcp-ports")
+		inletsProLicenseKey, _ = cmd.Flags().GetString("license")
+	}
+
+	if pro {
+		inletsControlPort = inletsProControlPort
 	}
 
 	name := strings.Replace(names.GetRandomName(10), "_", "-", -1)
@@ -192,49 +239,53 @@ func runCreate(cmd *cobra.Command, _ []string) error {
 			return err
 		}
 
-		fmt.Printf("[%d/%d] Host: %s, status: %s\n",
-			i+1, max, hostStatus.ID, hostStatus.Status)
-
 		if hostStatus.Status == "active" {
-			if !pro {
-				fmt.Printf(`Inlets OSS exit-node summary:
-  IP: %s
-  Auth-token: %s
+			if delTunnel == true {
+				sig := make(chan os.Signal, 1)
+				done := make(chan bool, 1)
 
-Command:
-  export UPSTREAM=http://127.0.0.1:8000
-  inlets client --remote "ws://%s:%d" \
-	--token "%s" \
-	--upstream $UPSTREAM
+				signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
-To Delete:
-	inletsctl delete --provider %s --id "%s"
-`,
-					hostStatus.IP, inletsToken, hostStatus.IP, inletsControlPort, inletsToken, provider, hostStatus.ID)
+				go func() {
+					sigval := <-sig
+					fmt.Printf("\n%v\n", sigval)
+					done <- true
+					close(sig)
+				}()
+
+				fmt.Printf("Your IP is: %s\n", hostStatus.IP)
+
+				var err error = nil
+				if pro {
+					err = runInletsClient(pro, hostStatus.IP, inletsControlPort, remoteTCP, inletsToken, tcpPorts, inletsProLicenseKey)
+				} else {
+					err = runInletsClient(pro, hostStatus.IP, inletsControlPort, upstream, inletsToken, tcpPorts, "")
+				}
+				if err != nil {
+					return fmt.Errorf("Error running inlets: %v", err)
+				}
+
+				<-done
+				close(done)
+				hostDelReq := provision.HostDeleteRequest{
+					ID:        hostStatus.ID,
+					IP:        hostStatus.IP,
+					ProjectID: projectID,
+					Zone:      zone,
+				}
+				fmt.Printf("Deleting host: %s with IP: %s from %s\n", hostStatus.ID, hostStatus.IP, provider)
+				err = provisioner.Delete(hostDelReq)
+				if err != nil {
+					return fmt.Errorf("error deleting the exitnode: %v", err)
+				}
+				fmt.Println("exiting")
+				return nil
+			} else {
+				printExample(pro, hostStatus, inletsToken, provider, inletsControlPort)
 				return nil
 			}
-
-			fmt.Printf(`inlets-pro exit-node summary:
-  IP: %s
-  Auth-token: %s
-
-Command:
-  export TCP_PORTS="8000"
-  export LICENSE=""
-  inlets-pro client --connect "wss://%s:%d/connect" \
-	--token "%s" \
-	--license "$LICENSE" \
-	--tcp-ports $TCP_PORTS
-
-To Delete:
-	  inletsctl delete --provider %s --id "%s"
-`,
-				hostStatus.IP, inletsToken, hostStatus.IP, inletsProControlPort, inletsToken, provider, hostStatus.ID)
-
-			return nil
 		}
 	}
-
 	return err
 }
 
@@ -352,19 +403,131 @@ curl -sLO https://raw.githubusercontent.com/inlets/inlets/master/hack/inlets-ope
 	}
 
 	return `#!/bin/bash
-export AUTHTOKEN="` + authToken + `"
-export REMOTETCP="` + remoteTCP + `"
-export IP=$(curl -sfSL https://ifconfig.co)
+	export AUTHTOKEN="` + authToken + `"
+	export REMOTETCP="` + remoteTCP + `"
+	export IP=$(curl -sfSL https://ifconfig.co)
+	
+	curl -SLsf https://github.com/inlets/inlets-pro/releases/download/0.4.3/inlets-pro > /tmp/inlets-pro && \
+	chmod +x /tmp/inlets-pro  && \
+	mv /tmp/inlets-pro /usr/local/bin/inlets-pro
+	
+	curl -sLO https://raw.githubusercontent.com/inlets/inlets/master/hack/inlets-pro.service  && \
+		mv inlets-pro.service /etc/systemd/system/inlets-pro.service && \
+		echo "AUTHTOKEN=$AUTHTOKEN" >> /etc/default/inlets-pro && \
+		echo "REMOTETCP=$REMOTETCP" >> /etc/default/inlets-pro && \
+		echo "IP=$IP" >> /etc/default/inlets-pro && \
+		systemctl start inlets-pro && \
+		systemctl enable inlets-pro`
+}
 
-curl -SLsf https://github.com/inlets/inlets-pro/releases/download/0.4.3/inlets-pro > /tmp/inlets-pro && \
-  chmod +x /tmp/inlets-pro  && \
-  mv /tmp/inlets-pro /usr/local/bin/inlets-pro
+func printExample(pro bool, hostStatus *provision.ProvisionedHost, inletsToken string, provider string, inletsControlPort int) {
+	if !pro {
+		fmt.Printf(`Inlets OSS exit-node summary:
+IP: %s
+Auth-token: %s
 
-curl -sLO https://raw.githubusercontent.com/inlets/inlets/master/hack/inlets-pro.service  && \
-  mv inlets-pro.service /etc/systemd/system/inlets-pro.service && \
-  echo "AUTHTOKEN=$AUTHTOKEN" >> /etc/default/inlets-pro && \
-  echo "REMOTETCP=$REMOTETCP" >> /etc/default/inlets-pro && \
-  echo "IP=$IP" >> /etc/default/inlets-pro && \
-  systemctl start inlets-pro && \
-  systemctl enable inlets-pro`
+Command:
+export UPSTREAM=http://127.0.0.1:3000
+inlets client --remote "ws://%s:%d" \
+--token "%s" \
+--upstream $UPSTREAM
+
+To Delete:
+inletsctl delete --provider %s --id "%s"
+`,
+			hostStatus.IP, inletsToken, hostStatus.IP, inletsControlPort, inletsToken, provider, hostStatus.ID)
+	} else {
+		fmt.Printf(`inlets-pro exit-node summary:
+IP: %s
+Auth-token: %s
+
+Command:
+export TCP_PORTS="8000"
+export LICENSE=""
+inlets-pro client --connect "wss://%s:%d/connect" \
+--token "%s" \
+--license "$LICENSE" \
+--tcp-ports $TCP_PORTS
+
+To Delete:
+inletsctl delete --provider %s --id "%s"
+`,
+			hostStatus.IP, inletsToken, hostStatus.IP, inletsControlPort, inletsToken, provider, hostStatus.ID)
+	}
+}
+
+func checkIfInletsIsInstalled(usingPro bool) (bool, error) {
+	basePath := "/usr/local/bin/%s"
+	if usingPro {
+		basePath = fmt.Sprintf(basePath, "inlets-pro")
+	} else {
+		basePath = fmt.Sprintf(basePath, "inlets")
+	}
+
+	fileInfo, err := os.Stat(basePath)
+	if err != nil {
+		return false, fmt.Errorf("Error finding file: %v", err)
+	}
+
+	if strings.SplitAfter(basePath, "/usr/local/bin/")[1] == fileInfo.Name() {
+		return true, nil
+	}
+	return false, nil
+}
+
+func runInletsClient(pro bool, exitNodeIP string, inletsControlPort int, upstream string, authToken string, tcpPorts string, license string) error {
+	installed, err := checkIfInletsIsInstalled(pro)
+	if err != nil {
+		return fmt.Errorf("error checking if inlets is installed: %v", err)
+	}
+
+	if !installed {
+		return fmt.Errorf("inlets/inlets-pro not installed")
+	}
+
+	if !pro {
+		fmt.Printf("Starting 'inlets client' now, hit control+c to delete the tunnel\n\n")
+		cmd := execute.ExecTask{
+			Command: "inlets",
+			Args: []string{"client", "--remote",
+				fmt.Sprintf("ws://%s:%d", exitNodeIP, inletsControlPort),
+				"--token", authToken, "--upstream", upstream},
+			StreamStdio: true,
+		}
+		_, err := cmd.Execute()
+		if err != nil {
+			return fmt.Errorf("Error running inlets: %v", err)
+		}
+
+	} else {
+		fmt.Printf("Starting 'inlets-pro client' in 15 secs, hit control+c to delete the tunnel\n\n")
+		max := 5
+		code := 1
+		if code != 0 {
+			for i := 0; i < max; i++ {
+				time.Sleep(15 * time.Second)
+				cmd := execute.ExecTask{
+					Command: "inlets-pro",
+					Args: []string{"client", "--connect",
+						fmt.Sprintf("wss://%s:%d/connect", exitNodeIP, inletsControlPort),
+						"--token", authToken, "--tcp-ports", tcpPorts, "--license", license},
+					StreamStdio: true,
+				}
+				res, err := cmd.Execute()
+				if err != nil {
+					return fmt.Errorf("Error running inlets-pro: %v", err)
+				}
+				code = res.ExitCode
+				if res.ExitCode != 0 {
+					fmt.Printf("stdout: %q, stderr: %q, exit-code: %d\n", res.Stdout, res.Stderr, res.ExitCode)
+				}
+			}
+		}
+	}
+
+	if err != nil && fmt.Sprintf("%s", err) != "signal: interrupt" {
+		return fmt.Errorf("%v", err)
+	}
+
+	return nil
 }
