@@ -1,0 +1,4 @@
+spec:
+  containers:
+    - name: instance-1
+    args:\n        - server\n        - '--remote-tcp=127.0.0.1'\n      securityContext:\n        privileged: true\n      stdin: false\n      tty: false\n  restartPolicy: Always\n\n# This container declaration format is not public API and may change without notice. Please\n# use gcloud command-line tool or Google Cloud Console to run Containers on Google Compute Engine."

@@ -36,6 +36,11 @@ func (p *GCEProvisioner) Provision(host BasicHost) (*ProvisionedHost, error) {
 
 	// instance auto restart on failure
 	autoRestart := true
+	loggingEnabled := fmt.Sprint(true)
+
+	if host.Additional["pro"] == "true" && host.Additional["tmp"] == "true" {
+		host.Plan = "e2-micro"
+	}
 
 	instance := &compute.Instance{
 		Name:         host.Name,
@@ -53,7 +58,7 @@ func (p *GCEProvisioner) Provision(host BasicHost) (*ProvisionedHost, error) {
 				InitializeParams: &compute.AttachedDiskInitializeParams{
 					Description: "Boot Disk for the exit-node created by inlets-operator",
 					DiskName:    host.Name,
-					DiskSizeGb:  10,
+					DiskSizeGb:  15,
 					SourceImage: host.OS,
 				},
 			},
@@ -61,13 +66,18 @@ func (p *GCEProvisioner) Provision(host BasicHost) (*ProvisionedHost, error) {
 		Metadata: &compute.Metadata{
 			Items: []*compute.MetadataItems{
 				{
-					Key:   "startup-script",
+					Key:   "gce-container-declaration",
 					Value: &host.UserData,
+				},
+				{
+					Key:   "google-logging-enabled",
+					Value: &loggingEnabled,
 				},
 			},
 		},
 		Labels: map[string]string{
-			"inlets": "exit-node",
+			"inlets":       "exit-node",
+			"container-vm": "cos-stable-80-12739-78-0",
 		},
 		Tags: &compute.Tags{
 			Items: []string{
