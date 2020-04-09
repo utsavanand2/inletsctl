@@ -260,22 +260,46 @@ func runCreate(cmd *cobra.Command, _ []string) error {
 			if delTunnel == true {
 				sig := make(chan os.Signal)
 				done := make(chan bool)
+				deleted := make(chan bool)
 
 				signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+				fmt.Printf("Your IP is: %s\n", hostStatus.IP)
+
+				var err error = nil
+				ctx, cancelFunction := context.WithCancel(context.Background())
 
 				go func() {
 					sigval, ok := <-sig
 					fmt.Printf("\n%v\n", sigval)
+					cancelFunction()
 					done <- true
 					if ok {
 						close(sig)
 					}
 				}()
 
-				fmt.Printf("Your IP is: %s\n", hostStatus.IP)
+				go func() {
+					_, ok := <-done
+					if ok {
+						close(done)
+					}
 
-				var err error = nil
-				ctx, cancelFunction := context.WithCancel(context.Background())
+					hostDelReq := provision.HostDeleteRequest{
+						ID:        hostStatus.ID,
+						IP:        hostStatus.IP,
+						ProjectID: projectID,
+						Zone:      zone,
+					}
+					fmt.Printf("Deleting host: %s with IP: %s from %s\n", hostStatus.ID, hostStatus.IP, provider)
+					err = provisioner.Delete(hostDelReq)
+					if err != nil {
+						fmt.Printf("error deleting the exitnode: %v\n", err)
+					}
+
+					deleted <- true
+				}()
+
 				if pro {
 					timeout := 30
 					retries := 90
@@ -294,27 +318,12 @@ func runCreate(cmd *cobra.Command, _ []string) error {
 					return fmt.Errorf("Error running inlets: %v", err)
 				}
 
-				_, ok := <-done
-				if ok {
-					close(done)
-				}
-				cancelFunction()
+				<-deleted
+				close(deleted)
 
-				hostDelReq := provision.HostDeleteRequest{
-					ID:        hostStatus.ID,
-					IP:        hostStatus.IP,
-					ProjectID: projectID,
-					Zone:      zone,
-				}
-				fmt.Printf("Deleting host: %s with IP: %s from %s\n", hostStatus.ID, hostStatus.IP, provider)
-				err = provisioner.Delete(hostDelReq)
-				if err != nil {
-					return fmt.Errorf("error deleting the exitnode: %v", err)
-				}
 				fmt.Println("exiting")
 				return nil
 			}
-
 			printExample(pro, hostStatus, inletsToken, provider, inletsControlPort)
 			return nil
 		}
@@ -582,7 +591,7 @@ func checkServiceUp(ctx context.Context, url string, timeout int, retries int) (
 
 	for i := 0; i < retries; i++ {
 		select {
-		case <-req.Context().Done():
+		case <-ctx.Done():
 			return false, fmt.Errorf("%s", "interrupt")
 		default:
 			res, err := httpClient.Do(req)
