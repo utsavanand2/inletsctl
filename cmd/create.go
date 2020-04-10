@@ -260,7 +260,6 @@ func runCreate(cmd *cobra.Command, _ []string) error {
 			if delTunnel == true {
 				sig := make(chan os.Signal)
 				done := make(chan bool)
-				deleted := make(chan bool)
 
 				signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
@@ -273,16 +272,8 @@ func runCreate(cmd *cobra.Command, _ []string) error {
 					sigval, ok := <-sig
 					fmt.Printf("\n%v\n", sigval)
 					cancelFunction()
-					done <- true
 					if ok {
 						close(sig)
-					}
-				}()
-
-				go func() {
-					_, ok := <-done
-					if ok {
-						close(done)
 					}
 
 					hostDelReq := provision.HostDeleteRequest{
@@ -297,7 +288,7 @@ func runCreate(cmd *cobra.Command, _ []string) error {
 						fmt.Printf("error deleting the exitnode: %v\n", err)
 					}
 
-					deleted <- true
+					done <- true
 				}()
 
 				if pro {
@@ -306,20 +297,32 @@ func runCreate(cmd *cobra.Command, _ []string) error {
 					url := fmt.Sprintf("https://%s:%d/.well-known/ca.crt", hostStatus.IP, inletsControlPort)
 					up, err := checkServiceUp(ctx, url, timeout, retries)
 					if err != nil {
-						return fmt.Errorf("%v", err)
+						fmt.Printf("%v\n", err)
 					}
 					if up {
 						err = runInletsClient(pro, hostStatus.IP, inletsControlPort, remoteTCP, inletsToken, tcpPorts, inletsProLicenseKey)
+						// Delete the host after getting an error while running inlets client by
+						// sending SIGINT to the sig channel
+						if err != nil {
+							fmt.Printf("Error running inlets: %v\n", err)
+							fmt.Println("Sending SIGINT.")
+							sig <- syscall.SIGINT
+						}
 					}
 				} else {
 					err = runInletsClient(pro, hostStatus.IP, inletsControlPort, upstream, inletsToken, tcpPorts, "")
-				}
-				if err != nil {
-					return fmt.Errorf("Error running inlets: %v", err)
+					// Delete the host after getting an error while running inlets client by
+					// sending SIGINT to the sig channel
+					if err != nil {
+						fmt.Printf("Error running inlets: %v\n", err)
+						fmt.Println("Sending SIGINT.")
+						sig <- syscall.SIGINT
+					}
 				}
 
-				<-deleted
-				close(deleted)
+				// Wait for the host deletion to complete
+				<-done
+				close(done)
 
 				fmt.Println("exiting")
 				return nil
